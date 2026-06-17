@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Scaffold for running rundeck-per-step.
+# Copy to run.sh and fill in your tokens. run.sh is gitignored.
+set -euo pipefail
+
+# --- default environment (used when --env is not passed) ---
+export RUNDECK_URL=""
+export RUNDECK_TOKEN=""
+
+# --- named environments (uncomment and fill in as needed) ---
+# export RUNDECK_PROD_URL=""
+# export RUNDECK_PROD_TOKEN=""
+# export RUNDECK_DEV_URL=""
+# export RUNDECK_DEV_TOKEN=""
+# export RUNDECK_EMEA_URL=""
+# export RUNDECK_EMEA_TOKEN=""
+
+# --- price per executed step (USD) ---
+PRICE="0.01"
+
+cd "$(dirname "$0")"
+[[ -x ./rundeck-per-step ]] || go build -o rundeck-per-step .
+
+# Examples:
+#   ./run.sh
+#   ./run.sh --env prod
+#   ./run.sh --since 30d --project payments
+#   ./run.sh --from 2026-06-01 --to 2026-06-30
+exec ./rundeck-per-step --price "$PRICE" "$@"

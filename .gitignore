@@ -1,0 +1,14 @@
+# local credentials — never commit
+run.sh
+.env
+.env.*
+
+# build artifacts
+/rundeck-per-step
+/dist/
+
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
