@@ -49,13 +49,33 @@ type executionsResp struct {
 	} `json:"paging"`
 }
 
+type execSummary struct {
+	ID     json.Number `json:"id"`
+	Status string      `json:"status"`
+}
+
+type execListPage struct {
+	Paging struct {
+		Count, Total, Offset, Max int
+	} `json:"paging"`
+	Executions []execSummary `json:"executions"`
+}
+
+type stateResp struct {
+	Steps []struct {
+		ExecutionState string `json:"executionState"`
+	} `json:"steps"`
+}
+
 type jobRef struct {
 	project, full, id string
 }
 
 type result struct {
-	project, full string
-	execs, steps  int
+	project, full       string
+	execs, steps        int
+	stepExecs           int
+	exact               bool
 }
 
 func main() {
@@ -69,6 +89,8 @@ func main() {
 	sinceFlag := flag.String("since", "", "relative window e.g. 24h, 7d, 4w, 6m, 1y. Mutually exclusive with --from/--to")
 	fromFlag := flag.String("from", "", "start date YYYY-MM-DD inclusive (UTC). Pair with --to")
 	toFlag := flag.String("to", "", "end date YYYY-MM-DD inclusive (UTC). Pair with --from")
+	accurateFlag := flag.Bool("accurate", false, "hybrid accurate mode: succeeded runs use static step count; non-succeeded runs fetch /execution/{id}/state")
+	concurrencyFlag := flag.Int("concurrency", 8, "parallel state fetches when --accurate is set")
 	flag.Parse()
 
 	dateFilter, label, err := buildDateFilter(*sinceFlag, *fromFlag, *toFlag)
@@ -125,17 +147,30 @@ func main() {
 		steps, err := c.jobSteps(j.id)
 		if err != nil {
 			u.errorf("steps %s/%s: %v\n", j.project, j.full, err)
-			u.advance(0, 0)
+			u.finishJob()
 			continue
 		}
-		execs, err := c.jobExecCount(j.project, j.id)
-		if err != nil {
-			u.errorf("execs %s/%s: %v\n", j.project, j.full, err)
-			u.advance(0, 0)
-			continue
+		if *accurateFlag {
+			execs, stepExecs, err := c.jobAccurate(j.project, j.id, steps, *concurrencyFlag,
+				func(stepExecsThisRun int) { u.addExec(stepExecsThisRun) })
+			if err != nil {
+				u.errorf("accurate %s/%s: %v\n", j.project, j.full, err)
+				u.finishJob()
+				continue
+			}
+			results = append(results, result{j.project, j.full, execs, steps, stepExecs, true})
+		} else {
+			execs, err := c.jobExecCount(j.project, j.id)
+			if err != nil {
+				u.errorf("execs %s/%s: %v\n", j.project, j.full, err)
+				u.finishJob()
+				continue
+			}
+			total := steps * execs
+			results = append(results, result{j.project, j.full, execs, steps, total, false})
+			u.addStepExecs(execs, total)
 		}
-		results = append(results, result{j.project, j.full, execs, steps})
-		u.advance(execs, steps)
+		u.finishJob()
 	}
 	u.stop()
 
@@ -148,15 +183,19 @@ func main() {
 	fmt.Fprintln(w, "PROJECT\tJOB\tEXECUTIONS\tSTEPS\tSTEP_EXECS\tCOST_USD")
 	var grandSteps int
 	var grandCost float64
+	mode := "static"
+	if *accurateFlag {
+		mode = "accurate (hybrid)"
+	}
+	fmt.Fprintf(os.Stdout, "Mode:  %s\n", mode)
 	for _, r := range results {
 		if r.execs == 0 {
 			continue
 		}
-		total := r.steps * r.execs
-		cost := float64(total) * *priceFlag
-		grandSteps += total
+		cost := float64(r.stepExecs) * *priceFlag
+		grandSteps += r.stepExecs
 		grandCost += cost
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%.2f\n", r.project, r.full, r.execs, r.steps, total, cost)
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%.2f\n", r.project, r.full, r.execs, r.steps, r.stepExecs, cost)
 	}
 	fmt.Fprintf(w, "TOTAL\t\t\t\t%d\t%.2f\n", grandSteps, grandCost)
 	w.Flush()
@@ -192,6 +231,16 @@ DATE RANGE (executions counted; static step count is unaffected)
 PRICING
   --price <usd>        price per executed step. Default 0.01 ($0.01 = 1 cent per step).
                          cost = price × executions × steps_in_job_definition
+
+ACCURACY
+  Default              "static": cost = price × executions × steps_in_job_definition.
+                       Fast (1 API call per job) but over-counts when jobs abort early.
+  --accurate           hybrid accurate mode. For each execution:
+                         status=succeeded    -> use static step count (cheap)
+                         everything else     -> fetch /execution/{id}/state and count
+                                                steps where executionState != NOT_STARTED.
+                       Slower: O(executions in window) extra API calls per job.
+  --concurrency <n>    parallel state fetches when --accurate is set (default 8)
 
 OUTPUT / DISPLAY
   --api <version>      Rundeck API version (default 46)
@@ -337,6 +386,101 @@ func (c *client) jobExecCount(proj, id string) (int, error) {
 	return out.Paging.Total, nil
 }
 
+func (c *client) listJobExecutions(proj, id string) ([]execSummary, error) {
+	var all []execSummary
+	offset := 0
+	for {
+		q := fmt.Sprintf("max=200&offset=%d&jobIdListFilter=%s", offset, url.QueryEscape(id))
+		if c.execFilter != "" {
+			q += "&" + c.execFilter
+		}
+		var page execListPage
+		if err := c.get("/project/"+url.PathEscape(proj)+"/executions?"+q, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page.Executions...)
+		got := len(page.Executions)
+		if got == 0 {
+			break
+		}
+		offset += got
+		if offset >= page.Paging.Total {
+			break
+		}
+	}
+	return all, nil
+}
+
+func (c *client) execStepsRun(id string) (int, error) {
+	var out stateResp
+	if err := c.get("/execution/"+url.PathEscape(id)+"/state", &out); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range out.Steps {
+		switch s.ExecutionState {
+		case "NOT_STARTED", "WAITING", "":
+		default:
+			n++
+		}
+	}
+	return n, nil
+}
+
+// jobAccurate enumerates executions in the window, sums actual step-executions.
+// Succeeded runs use staticSteps without a state fetch (hybrid).
+// onSampled is called once per execution processed, with the per-run step count.
+func (c *client) jobAccurate(proj, id string, staticSteps, workers int, onSampled func(int)) (int, int, error) {
+	execs, err := c.listJobExecutions(proj, id)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(execs) == 0 {
+		return 0, 0, nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var (
+		mu        sync.Mutex
+		total     int
+		wg        sync.WaitGroup
+		in        = make(chan execSummary)
+	)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range in {
+				var n int
+				if e.Status == "succeeded" {
+					n = staticSteps
+				} else {
+					got, err := c.execStepsRun(e.ID.String())
+					if err != nil {
+						n = staticSteps // fall back rather than abort the job
+					} else {
+						n = got
+					}
+				}
+				mu.Lock()
+				total += n
+				mu.Unlock()
+				if onSampled != nil {
+					onSampled(n)
+				}
+			}
+		}()
+	}
+	for _, e := range execs {
+		in <- e
+	}
+	close(in)
+	wg.Wait()
+	return len(execs), total, nil
+}
+
 func fatal(err error) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -386,10 +530,18 @@ func (u *ui) setStatus(s string) {
 
 func (u *ui) setTotal(n int) { atomic.StoreInt32(&u.total, int32(n)) }
 
-func (u *ui) advance(execs, steps int) {
-	atomic.AddInt32(&u.done, 1)
+func (u *ui) addStepExecs(execs, stepExecs int) {
 	atomic.AddInt64(&u.execs, int64(execs))
-	atomic.AddInt64(&u.stepExecs, int64(execs*steps))
+	atomic.AddInt64(&u.stepExecs, int64(stepExecs))
+}
+
+func (u *ui) addExec(stepExecs int) {
+	atomic.AddInt64(&u.execs, 1)
+	atomic.AddInt64(&u.stepExecs, int64(stepExecs))
+}
+
+func (u *ui) finishJob() {
+	atomic.AddInt32(&u.done, 1)
 }
 
 func (u *ui) errorf(format string, args ...any) {

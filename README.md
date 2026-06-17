@@ -85,14 +85,28 @@ rundeck-per-step --help                         # full reference
 | `--price <usd>`       | price per executed step. Default `0.01` |
 | `--api <version>`     | Rundeck API version. Default `46` |
 | `--quiet`             | disable the live spinner |
+| `--accurate`          | hybrid accurate mode — see below |
+| `--concurrency <n>`   | parallel state fetches in `--accurate` mode (default 8) |
 
 Jobs with zero executions in the selected window are hidden from the table.
 
 ## How counting works
 
-- **Steps**: static count of top-level workflow steps in the job definition (`sequence.commands`). Error handlers and nested-workflow sub-steps are not expanded.
+- **Steps** (column): static count of top-level workflow steps in the job definition (`sequence.commands`). Error handlers and nested-workflow sub-steps are not expanded.
 - **Executions**: total in the selected window, via `/api/V/project/{name}/executions?jobIdListFilter=...`. (Note: Rundeck's `/job/{id}/executions` endpoint silently ignores `recentFilter`; we don't use it.)
-- **Cost**: `price × steps × executions`. A 20-step job that ran once is 20 step-executions.
+- **Cost**: `price × step-execs`.
+
+### `--accurate` (hybrid) mode
+
+Default static mode does `cost = price × executions × steps`. It's fast (1 API call per job) but over-counts when jobs abort early — a 20-step job that fails at step 3 still gets billed for 20.
+
+`--accurate` switches to **per-execution** counting using a hybrid strategy:
+- `status=succeeded` → assume all defined steps ran (no extra API call)
+- everything else (`failed`, `aborted`, `timedout`, …) → fetch `/api/V/execution/{id}/state` and count steps with `executionState != NOT_STARTED`
+
+Cost is then `price × sum(actual_steps_executed)`. State fetches run in parallel (default 8 concurrent, tune with `--concurrency`).
+
+When to use it: monthly invoices, audits, anything where over-counting matters. For spot checks, leave it off — accurate mode can add minutes per scan depending on volume.
 
 ## Build from source
 
