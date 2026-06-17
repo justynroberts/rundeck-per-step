@@ -13,11 +13,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
-	"unsafe"
 )
 
 var httpClient = &http.Client{
@@ -467,17 +465,6 @@ func (u *ui) render() {
 	line := head + "\x1b[2m" + status + "\x1b[0m" + tail
 	line = truncToWidth(line, width-1)
 	fmt.Fprint(os.Stderr, "\r\x1b[2K"+line)
-}
-
-func termWidth() int {
-	type winsize struct{ Row, Col, X, Y uint16 }
-	ws := &winsize{}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stderr.Fd(),
-		uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(ws)))
-	if errno != 0 || ws.Col == 0 {
-		return 100
-	}
-	return int(ws.Col)
 }
 
 func visibleWidth(s string) int {
