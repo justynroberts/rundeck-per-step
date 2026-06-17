@@ -85,7 +85,7 @@ rundeck-per-step --help                         # full reference
 | `--price <usd>`       | price per executed step. Default `0.01` |
 | `--api <version>`     | Rundeck API version. Default `46` |
 | `--quiet`             | disable the live spinner |
-| `--accurate`          | hybrid accurate mode — see below |
+| `--accurate`          | exact mode — see below |
 | `--concurrency <n>`   | parallel state fetches in `--accurate` mode (default 8) |
 
 Jobs with zero executions in the selected window are hidden from the table.
@@ -96,17 +96,15 @@ Jobs with zero executions in the selected window are hidden from the table.
 - **Executions**: total in the selected window, via `/api/V/project/{name}/executions?jobIdListFilter=...`. (Note: Rundeck's `/job/{id}/executions` endpoint silently ignores `recentFilter`; we don't use it.)
 - **Cost**: `price × step-execs`.
 
-### `--accurate` (hybrid) mode
+### `--accurate` mode
 
-Default static mode does `cost = price × executions × steps`. It's fast (1 API call per job) but over-counts when jobs abort early — a 20-step job that fails at step 3 still gets billed for 20.
+Default static mode does `cost = price × executions × steps`. Fast (1 API call per job) but blind to what actually ran — it over-counts when steps are skipped via conditionals, early failures, or scheduler dispatch errors.
 
-`--accurate` switches to **per-execution** counting using a hybrid strategy:
-- `status=succeeded` → assume all defined steps ran (no extra API call)
-- everything else (`failed`, `aborted`, `timedout`, …) → fetch `/api/V/execution/{id}/state` and count steps with `executionState != NOT_STARTED`
+`--accurate` fetches `/api/V/execution/{id}/state` for **every** execution in the window and counts only steps with `executionState != NOT_STARTED` (so skipped/conditional/aborted-mid-workflow steps don't count). State fetches run in parallel (default 8, tune with `--concurrency`).
 
-Cost is then `price × sum(actual_steps_executed)`. State fetches run in parallel (default 8 concurrent, tune with `--concurrency`).
+Cost: O(executions in window) extra API calls per job. For a project with a few hundred execs per month, expect 30s–2m.
 
-When to use it: monthly invoices, audits, anything where over-counting matters. For spot checks, leave it off — accurate mode can add minutes per scan depending on volume.
+**Server-side requirement**: this mode only works if your Rundeck retains execution state. If state has been purged (the endpoint returns 404), the tool falls back to the static count for that execution — accurate mode then silently produces the same numbers as static. Check by hitting `/api/<v>/execution/<id>/state` directly; if you see `api.error.item.doesnotexist`, enable execution state retention on the server.
 
 ## Build from source
 

@@ -89,7 +89,7 @@ func main() {
 	sinceFlag := flag.String("since", "", "relative window e.g. 24h, 7d, 4w, 6m, 1y. Mutually exclusive with --from/--to")
 	fromFlag := flag.String("from", "", "start date YYYY-MM-DD inclusive (UTC). Pair with --to")
 	toFlag := flag.String("to", "", "end date YYYY-MM-DD inclusive (UTC). Pair with --from")
-	accurateFlag := flag.Bool("accurate", false, "hybrid accurate mode: succeeded runs use static step count; non-succeeded runs fetch /execution/{id}/state")
+	accurateFlag := flag.Bool("accurate", false, "exact mode: fetch /execution/{id}/state per execution, count only steps that actually ran (catches skipped/conditional steps)")
 	concurrencyFlag := flag.Int("concurrency", 8, "parallel state fetches when --accurate is set")
 	flag.Parse()
 
@@ -183,9 +183,9 @@ func main() {
 	fmt.Fprintln(w, "PROJECT\tJOB\tEXECUTIONS\tSTEPS\tSTEP_EXECS\tCOST_USD")
 	var grandSteps int
 	var grandCost float64
-	mode := "static"
+	mode := "static (defined-steps × executions)"
 	if *accurateFlag {
-		mode = "accurate (hybrid)"
+		mode = "accurate (per-execution state, counts only steps that actually ran)"
 	}
 	fmt.Fprintf(os.Stdout, "Mode:  %s\n", mode)
 	for _, r := range results {
@@ -234,12 +234,12 @@ PRICING
 
 ACCURACY
   Default              "static": cost = price × executions × steps_in_job_definition.
-                       Fast (1 API call per job) but over-counts when jobs abort early.
-  --accurate           hybrid accurate mode. For each execution:
-                         status=succeeded    -> use static step count (cheap)
-                         everything else     -> fetch /execution/{id}/state and count
-                                                steps where executionState != NOT_STARTED.
-                       Slower: O(executions in window) extra API calls per job.
+                       Fast (1 API call per job) but over-counts when steps are
+                       skipped (conditional steps, early failures, run-if logic).
+  --accurate           exact mode. For every execution, fetch /api/V/execution/{id}/state
+                       and count only steps where executionState != NOT_STARTED.
+                       Catches skipped/conditional steps even in succeeded runs.
+                       Cost: O(executions in window) extra API calls per job.
   --concurrency <n>    parallel state fetches when --accurate is set (default 8)
 
 OUTPUT / DISPLAY
@@ -453,16 +453,9 @@ func (c *client) jobAccurate(proj, id string, staticSteps, workers int, onSample
 		go func() {
 			defer wg.Done()
 			for e := range in {
-				var n int
-				if e.Status == "succeeded" {
-					n = staticSteps
-				} else {
-					got, err := c.execStepsRun(e.ID.String())
-					if err != nil {
-						n = staticSteps // fall back rather than abort the job
-					} else {
-						n = got
-					}
+				n, err := c.execStepsRun(e.ID.String())
+				if err != nil {
+					n = staticSteps // fall back rather than abort the job
 				}
 				mu.Lock()
 				total += n
